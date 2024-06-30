@@ -3,14 +3,14 @@
 
 typedef struct event_listener *EventListener;
 
-typedef void (*EventCallback)(int );
+typedef void (*EventCallback)(int , void *);
 
 EventListener event_listener_create(void);
 
 int event_listener_add(EventListener , int );
 int event_listener_del(EventListener , int );
 
-void event_listener_set_handler(EventListener , EventCallback );
+void event_listener_set_handler(EventListener , EventCallback , void *);
 
 int event_listener_start(EventListener );
 int event_listener_stop(EventListener );

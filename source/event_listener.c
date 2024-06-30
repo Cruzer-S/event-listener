@@ -25,6 +25,7 @@ typedef struct event_handler {
 	bool await;
 
 	EventCallback callback;
+	void *argument;
 } *EventHandler;
 
 struct event_listener {
@@ -86,7 +87,10 @@ static int event_handler(void *arg)
 			if (events[i].data.fd < 0)
 				handler->is_running = false;
 
-			handler->callback(events[i].data.fd);
+			handler->callback(
+				events[i].data.fd,
+				handler->argument
+			);
 		}
 	}
 
@@ -125,10 +129,13 @@ FREE_LISTENER:	free(listener);
 RETURN_NULL:	return NULL;
 }
 
-void event_listener_set_handler(EventListener listener, EventCallback callback)
+void event_listener_set_handler(
+	EventListener listener, EventCallback callback, void *argument)
 {
-	for (int i = 0; i < listener->n_handler; i++)
+	for (int i = 0; i < listener->n_handler; i++) {
 		HANDLER(listener, i)->callback = callback;
+		HANDLER(listener, i)->argument = argument;
+	}
 }
 
 int event_listener_add(EventListener listener, int fd)
