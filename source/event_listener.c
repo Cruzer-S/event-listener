@@ -9,11 +9,20 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
+#include "Cruzer-S/list/list.h"
+
 #define MAX_HANDLER	8
 #define MAX_EVENTS	128
 
-#define EVENT(E, F) (&(struct epoll_event) { .events = (E), .data.fd = (F) })
+#define EVENT(E, D) (&(struct epoll_event) { .events = (E), .data.ptr = (D) })
 #define HANDLER(L, F) (&((L)->handler[F % (L)->n_handler]))
+
+typedef struct event_data_internal
+{
+	struct event_data _;
+
+	struct list list;
+} *IEventData;
 
 typedef struct event_handler {
 	thrd_t tid;
@@ -21,17 +30,30 @@ typedef struct event_handler {
 	int epfd;
 	int evfd;
 
+	struct list event_data_list;
+
 	bool is_running;
 	bool await;
 
 	EventCallback callback;
-	void *argument;
 } *EventHandler;
 
 struct event_listener {
 	EventHandler handler;
 	int n_handler;
 };
+
+static IEventData event_data_create(int fd, void *arg)
+{
+	IEventData data = malloc(sizeof(struct event_data_internal));
+	if (data == NULL)
+		return NULL;
+
+	data->_.fd = fd;
+	data->_.arg = arg;
+
+	return data;
+}
 
 static int event_handler_init(EventHandler handler) 
 {
@@ -43,15 +65,22 @@ static int event_handler_init(EventHandler handler)
 	if (handler->evfd == -1)
 		goto CLOSE_EPOLL;
 
-	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, handler->evfd,
-		      EVENT(EPOLLIN, 0)) == -1)
+	IEventData data = event_data_create(handler->evfd, NULL);
+	if (data == NULL)
 		goto CLOSE_EVENT;
+
+	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, handler->evfd,
+		      EVENT(EPOLLIN, data)) == -1)
+		goto DESTROY_DATA;
 
 	handler->is_running = false;
 	handler->await = true;
 
+	list_init_head(&handler->event_data_list);
+
 	return 0;
 
+DESTROY_DATA:	free(data);
 CLOSE_EVENT:	close(handler->evfd);
 CLOSE_EPOLL:	close(handler->epfd);
 RETURN_ERROR:	return -1;
@@ -84,13 +113,12 @@ static int event_handler(void *arg)
 			return -1;
 
 		for (int i = 0; i < ret; i++) {
-			if (events[i].data.fd < 0)
+			IEventData data = events[i].data.ptr;
+
+			if (data->_.fd < 0)
 				handler->is_running = false;
 
-			handler->callback(
-				events[i].data.fd,
-				handler->argument
-			);
+			handler->callback(data->_.fd, data->_.arg);
 		}
 	}
 
@@ -130,20 +158,24 @@ RETURN_NULL:	return NULL;
 }
 
 void event_listener_set_handler(
-	EventListener listener, EventCallback callback, void *argument)
+	EventListener listener, EventCallback callback)
 {
-	for (int i = 0; i < listener->n_handler; i++) {
+	for (int i = 0; i < listener->n_handler; i++)
 		HANDLER(listener, i)->callback = callback;
-		HANDLER(listener, i)->argument = argument;
-	}
 }
 
-int event_listener_add(EventListener listener, int fd)
+int event_listener_add(EventListener listener, int fd, void *argument)
 {
 	EventHandler handler = HANDLER(listener, fd);
+	IEventData data = event_data_create(fd, argument);
+
+	if (data == NULL)
+		return -1;
+
+	list_add(&handler->event_data_list, &data->list);
 
 	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, fd,
-	       	      EVENT(EPOLLIN | EPOLLET, fd)) == -1)
+	       	      EVENT(EPOLLIN | EPOLLET, data)) == -1)
 		return -1;
 
 	return 0;
@@ -156,7 +188,19 @@ int event_listener_del(EventListener listener, int fd)
 	if (epoll_ctl(handler->epfd, EPOLL_CTL_DEL, fd, NULL) == -1)
 		return -1;
 
-	return 0; // not yet
+	LIST_FOREACH_ENTRY_SAFE(&handler->event_data_list, cur,
+			 	struct event_data_internal, list)
+	{
+		if (cur->_.fd != fd)
+			continue;
+
+		list_del(&cur->list);
+		free(cur);
+
+		return 0;
+	}
+
+	return -1;
 }
 
 int event_listener_start(EventListener listener)
