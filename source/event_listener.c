@@ -17,12 +17,13 @@
 #define EVENT(E, D) (&(struct epoll_event) { .events = (E), .data.ptr = (D) })
 #define HANDLER(L, F) (&((L)->handler[F % (L)->n_handler]))
 
-typedef struct event_data_internal
+typedef struct event_data
 {
-	struct event_data _;
+	int fd;
+	void *arg;
 
 	struct list list;
-} *IEventData;
+} *EventData;
 
 typedef struct event_handler {
 	thrd_t tid;
@@ -43,14 +44,14 @@ struct event_listener {
 	int n_handler;
 };
 
-static IEventData event_data_create(int fd, void *arg)
+static EventData event_data_create(int fd, void *arg)
 {
-	IEventData data = malloc(sizeof(struct event_data_internal));
+	EventData data = malloc(sizeof(struct event_data));
 	if (data == NULL)
 		return NULL;
 
-	data->_.fd = fd;
-	data->_.arg = arg;
+	data->fd = fd;
+	data->arg = arg;
 
 	return data;
 }
@@ -65,7 +66,7 @@ static int event_handler_init(EventHandler handler)
 	if (handler->evfd == -1)
 		goto CLOSE_EPOLL;
 
-	IEventData data = event_data_create(handler->evfd, NULL);
+	EventData data = event_data_create(handler->evfd, NULL);
 	if (data == NULL)
 		goto CLOSE_EVENT;
 
@@ -113,12 +114,12 @@ static int event_handler(void *arg)
 			return -1;
 
 		for (int i = 0; i < ret; i++) {
-			IEventData data = events[i].data.ptr;
+			EventData data = events[i].data.ptr;
 
-			if (data->_.fd < 0)
+			if (data->fd < 0)
 				handler->is_running = false;
 
-			handler->callback(data->_.fd, data->_.arg);
+			handler->callback(data->fd, data->arg);
 		}
 	}
 
@@ -167,7 +168,7 @@ void event_listener_set_handler(
 int event_listener_add(EventListener listener, int fd, void *argument)
 {
 	EventHandler handler = HANDLER(listener, fd);
-	IEventData data = event_data_create(fd, argument);
+	EventData data = event_data_create(fd, argument);
 
 	if (data == NULL)
 		return -1;
@@ -189,9 +190,9 @@ int event_listener_del(EventListener listener, int fd)
 		return -1;
 
 	LIST_FOREACH_ENTRY_SAFE(&handler->event_data_list, cur,
-			 	struct event_data_internal, list)
+			 	struct event_data, list)
 	{
-		if (cur->_.fd != fd)
+		if (cur->fd != fd)
 			continue;
 
 		list_del(&cur->list);

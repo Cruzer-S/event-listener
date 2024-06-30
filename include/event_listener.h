@@ -1,11 +1,6 @@
 #ifndef EVENT_LISTENER_H__
 #define EVENT_LISTENER_H__
 
-typedef struct event_data {
-	int fd;
-	void *arg;
-} *EventData;
-
 typedef struct event_listener *EventListener;
 
 typedef void (*EventCallback)(int , void *);
