@@ -14,13 +14,16 @@
 #define MAX_HANDLER	8
 #define MAX_EVENTS	128
 
-#define EVENT(E, D) (&(struct epoll_event) { .events = (E), .data.ptr = (D) })
+#define EVENT(E, P) (&(struct epoll_event) { .events = (E), .data.ptr = (P)})
 #define HANDLER(L, F) (&((L)->handler[F % (L)->n_handler]))
 
-typedef struct event_data
-{
+typedef struct event_data {
 	int fd;
-	void *arg;
+	int ev;
+	void *ptr;
+	EventCallback callback;
+
+	bool do_close;
 
 	struct list list;
 } *EventData;
@@ -31,12 +34,11 @@ typedef struct event_handler {
 	int epfd;
 	int evfd;
 
-	struct list event_data_list;
+	int n_event;
+	struct list events;
 
 	bool is_running;
 	bool await;
-
-	EventCallback callback;
 } *EventHandler;
 
 struct event_listener {
@@ -44,58 +46,97 @@ struct event_listener {
 	int n_handler;
 };
 
-static EventData event_data_create(int fd, void *arg)
+static EventHandler find_least_event_handler(EventListener listener)
 {
-	EventData data = malloc(sizeof(struct event_data));
-	if (data == NULL)
+	EventHandler least;
+
+	if (listener->n_handler <= 0)
 		return NULL;
 
-	data->fd = fd;
-	data->arg = arg;
+	least = &listener->handler[0];
 
-	return data;
+	for (int i = 1; i < listener->n_handler; i++)
+		if (least->n_event > listener->handler[i].n_event)
+			least = &listener->handler[i];
+
+	return least;
 }
 
-static int event_handler_init(EventHandler handler) 
+static EventData find_event_data_by_fd(EventHandler handler, int fd)
 {
-	handler->epfd = epoll_create1(0);
-	if (handler->epfd == -1)
-		goto RETURN_ERROR;
+	LIST_FOREACH_ENTRY(&handler->events, cur, struct event_data, list)
+		if (cur->fd == fd)
+			return cur;
 
-	handler->evfd = eventfd(0, 0);
-	if (handler->evfd == -1)
+	return NULL;
+}
+
+static EventHandler find_handler_by_fd(EventListener listener, int fd)
+{
+	for (int i = 0; i < listener->n_handler; i++)
+		if (find_event_data_by_fd(&listener->handler[i], fd))
+			return &listener->handler[i];
+
+	return NULL;
+}
+
+static EventHandler event_handler_create(void) 
+{
+	EventHandler handler;
+	int evfd, epfd;
+
+	handler = malloc(sizeof(struct event_handler));
+	if (handler == NULL)
+		goto RETURN_NULL;
+
+	epfd = epoll_create1(0);
+	if (epfd == -1)
+		goto FREE_HANDLER;
+
+	evfd = eventfd(0, 0);
+	if (evfd == -1)
 		goto CLOSE_EPOLL;
-
-	EventData data = event_data_create(handler->evfd, NULL);
-	if (data == NULL)
+	
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, 
+	       	      evfd, EVENT(EPOLLIN, handler)) == -1)
 		goto CLOSE_EVENT;
 
-	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, handler->evfd,
-		      EVENT(EPOLLIN, data)) == -1)
-		goto DESTROY_DATA;
-
+	handler->epfd = epfd;
 	handler->is_running = false;
 	handler->await = true;
 
-	list_init_head(&handler->event_data_list);
+	handler->n_event = 0;
+
+	list_init_head(&handler->events);
 
 	return 0;
 
-DESTROY_DATA:	free(data);
-CLOSE_EVENT:	close(handler->evfd);
-CLOSE_EPOLL:	close(handler->epfd);
-RETURN_ERROR:	return -1;
+CLOSE_EVENT:	close(evfd);
+CLOSE_EPOLL:	close(epfd);
+FREE_HANDLER:	free(handler);
+RETURN_NULL:	return NULL;
 }
 
-static int event_handler_cleanup(EventHandler handler)
+static void event_handler_destroy(EventHandler handler)
 {
-	if (epoll_ctl(handler->epfd, EPOLL_CTL_DEL, handler->evfd, NULL) == -1)
-		return -1;
-
 	close(handler->evfd);
 	close(handler->epfd);
 
-	return 0;
+	free(handler);
+}
+
+static void delete_event(EventHandler handler, EventData data)
+{
+	list_del(&data->list);
+
+	epoll_ctl(handler->epfd, EPOLL_CTL_DEL, data->ev, NULL);
+	epoll_ctl(handler->epfd, EPOLL_CTL_DEL, data->fd, NULL);
+
+	close(data->ev);
+
+	free(data);
+
+	handler->n_event--;
 }
 
 static int event_handler(void *arg)
@@ -104,22 +145,29 @@ static int event_handler(void *arg)
 
 	int n_events = MAX_EVENTS;
 	struct epoll_event events[n_events];
+	int epfd = handler->epfd;
 
 	while (handler->await) sleep(1);
 
-	while (handler->is_running)
-	{
-		int ret = epoll_wait(handler->epfd, events, n_events, -1);
+	while (handler->is_running) {
+		int ret = epoll_wait(epfd, events, n_events, -1);
 		if (ret == -1)
 			return -1;
 
 		for (int i = 0; i < ret; i++) {
 			EventData data = events[i].data.ptr;
-
-			if (data->fd < 0)
+			if (data == (void *) handler) {
 				handler->is_running = false;
+				continue;
+			}
 
-			handler->callback(data->fd, data->arg);
+			if (data->do_close) {
+				delete_event(handler, data);
+				continue;
+			}
+
+			if (data->callback != NULL)
+				data->callback(data->fd, data->ptr);
 		}
 	}
 
@@ -135,17 +183,17 @@ EventListener event_listener_create(void)
 		goto RETURN_NULL;
 
 	listener->n_handler = MAX_HANDLER;
-
 	listener->handler = malloc(
 		sizeof(struct event_handler) * listener->n_handler
 	);
 	if (listener->handler == NULL)
 		goto FREE_LISTENER;
 
-	for (int i = 0; i < MAX_HANDLER; i++) {
-		if (event_handler_init(&listener->handler[i]) == -1) {
-			for (int j = i - 1; j >= 0; j++)
-				event_handler_cleanup(&listener->handler[j]);
+	for (int i = 0; i < listener->n_handler; i++) {
+		EventHandler handler = event_handler_create();
+		if (handler == NULL) {
+			for (int j = i - 1; j >= 0; j--)
+				event_handler_destroy(&listener->handler[j]);
 
 			goto FREE_HANDLER;
 		}
@@ -158,50 +206,61 @@ FREE_LISTENER:	free(listener);
 RETURN_NULL:	return NULL;
 }
 
-void event_listener_set_handler(
-	EventListener listener, EventCallback callback)
+int event_listener_add(EventListener listener,
+		       int fd, void *ptr, EventCallback callback)
 {
-	for (int i = 0; i < listener->n_handler; i++)
-		HANDLER(listener, i)->callback = callback;
-}
-
-int event_listener_add(EventListener listener, int fd, void *argument)
-{
-	EventHandler handler = HANDLER(listener, fd);
-	EventData data = event_data_create(fd, argument);
+	EventHandler handler = find_least_event_handler(listener);
+	EventData data = malloc(sizeof(struct event_data));
+	int evfd;
 
 	if (data == NULL)
-		return -1;
+		goto RETURN_ERROR;
 
-	list_add(&handler->event_data_list, &data->list);
+	evfd = eventfd(0, 0);
+	if (evfd == -1)
+		goto FREE_DATA;
+
+	data->fd = fd;
+	data->ev = evfd;
+	data->ptr = ptr;
+	data->callback = callback;
+
+	data->do_close = false;
 
 	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, fd,
 	       	      EVENT(EPOLLIN | EPOLLET, data)) == -1)
-		return -1;
+		goto DELETE_EVENT;
+
+	if (epoll_ctl(handler->epfd, EPOLL_CTL_ADD, evfd,
+	       	      EVENT(EPOLLIN | EPOLLET, data)) == -1)
+		goto CLOSE_EVENT;
+
+	handler->n_event++;
+
+	list_add(&handler->events, &data->list);
 
 	return 0;
+
+DELETE_EVENT:	epoll_ctl(handler->epfd, EPOLL_CTL_DEL, fd, NULL);
+CLOSE_EVENT:	close(data->ev);
+FREE_DATA:	free(data);
+RETURN_ERROR:	return -1;
 }
 
 int event_listener_del(EventListener listener, int fd)
 {
-	EventHandler handler = HANDLER(listener, fd);
-
-	if (epoll_ctl(handler->epfd, EPOLL_CTL_DEL, fd, NULL) == -1)
+	EventHandler handler = find_handler_by_fd(listener, fd);
+	if (handler == NULL)
 		return -1;
 
-	LIST_FOREACH_ENTRY_SAFE(&handler->event_data_list, cur,
-			 	struct event_data, list)
-	{
-		if (cur->fd != fd)
-			continue;
+	EventData data = find_event_data_by_fd(handler, fd);
+	if (data == NULL)
+		return -1;
 
-		list_del(&cur->list);
-		free(cur);
+	data->do_close = true;
+	eventfd_write(data->ev, 1);
 
-		return 0;
-	}
-
-	return -1;
+	return 0;
 }
 
 int event_listener_start(EventListener listener)
@@ -212,22 +271,17 @@ int event_listener_start(EventListener listener)
 
 		h->await = true;
 		if (thrd_create(&h->tid, event_handler, h) != thrd_success) {
-			goto STOP_THREAD;
+			for (int j = i - 1; j >= 0; j--) {
+				EventHandler h = HANDLER(listener, i);
+				h->is_running = false;
+				h->await = false;
+
+				if (thrd_join(h->tid, NULL) != thrd_success)
+					continue;
+			}
+
+			return -1;
 		}
-
-		continue;
-
-	STOP_THREAD:
-		for (int j = i - 1; j >= 0; j--) {
-			EventHandler h = HANDLER(listener, i);
-			h->is_running = false;
-			h->await = false;
-
-			if (thrd_join(h->tid, NULL) != thrd_success)
-				continue;
-		}
-
-		return -1;
 	}
 
 	for (int i = 0; i < listener->n_handler; i++) {
@@ -241,16 +295,16 @@ int event_listener_start(EventListener listener)
 int event_listener_stop(EventListener listener)
 {
 	for (int i = 0; i < listener->n_handler; i++) {
-		EventHandler h = HANDLER(listener, i);
+		EventHandler handler = HANDLER(listener, i);
 
-		if (eventfd_write(h->evfd, 1) == -1)
+		if (eventfd_write(handler->evfd, 1) == -1)
 			return -1;
 	}
 
 	for (int i = 0; i < listener->n_handler; i++) {
-		EventHandler h = HANDLER(listener, i);
+		EventHandler handler = HANDLER(listener, i);
 
-		if (thrd_join(h->tid, NULL) != thrd_success)
+		if (thrd_join(handler->tid, NULL) != thrd_success)
 			return -1;
 	}
 
@@ -260,11 +314,9 @@ int event_listener_stop(EventListener listener)
 int event_listener_destroy(EventListener listener)
 {
 	for (int i = 0; i < listener->n_handler; i++)
-		if (event_handler_cleanup(&listener->handler[i]) == -1)
-			return -1;
+		event_handler_destroy(&listener->handler[i]);
 
 	free(listener->handler);
-
 	free(listener);
 
 	return 0;
