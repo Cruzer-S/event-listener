@@ -101,6 +101,7 @@ static EventHandler event_handler_create(void)
 		goto CLOSE_EVENT;
 
 	handler->epfd = epfd;
+	handler->evfd = evfd;
 	handler->is_running = false;
 	handler->await = true;
 
