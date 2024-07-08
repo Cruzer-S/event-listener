@@ -42,7 +42,7 @@ typedef struct event_handler {
 } *EventHandler;
 
 struct event_listener {
-	EventHandler handler;
+	EventHandler *handler;
 	int n_handler;
 };
 
@@ -53,11 +53,11 @@ static EventHandler find_least_event_handler(EventListener listener)
 	if (listener->n_handler <= 0)
 		return NULL;
 
-	least = &listener->handler[0];
+	least = listener->handler[0];
 
 	for (int i = 1; i < listener->n_handler; i++)
-		if (least->n_event > listener->handler[i].n_event)
-			least = &listener->handler[i];
+		if (least->n_event > listener->handler[i]->n_event)
+			least = listener->handler[i];
 
 	return least;
 }
@@ -74,8 +74,8 @@ static EventData find_event_data_by_fd(EventHandler handler, int fd)
 static EventHandler find_handler_by_fd(EventListener listener, int fd)
 {
 	for (int i = 0; i < listener->n_handler; i++)
-		if (find_event_data_by_fd(&listener->handler[i], fd))
-			return &listener->handler[i];
+		if (find_event_data_by_fd(listener->handler[i], fd))
+			return listener->handler[i];
 
 	return NULL;
 }
@@ -184,16 +184,16 @@ EventListener event_listener_create(void)
 
 	listener->n_handler = MAX_HANDLER;
 	listener->handler = malloc(
-		sizeof(struct event_handler) * listener->n_handler
+		sizeof(EventHandler) * listener->n_handler
 	);
 	if (listener->handler == NULL)
 		goto FREE_LISTENER;
 
 	for (int i = 0; i < listener->n_handler; i++) {
-		EventHandler handler = event_handler_create();
-		if (handler == NULL) {
+		listener->handler[i] = event_handler_create();
+		if (listener->handler[i] == NULL) {
 			for (int j = i - 1; j >= 0; j--)
-				event_handler_destroy(&listener->handler[j]);
+				event_handler_destroy(listener->handler[j]);
 
 			goto FREE_HANDLER;
 		}
