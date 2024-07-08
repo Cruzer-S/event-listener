@@ -15,7 +15,6 @@
 #define MAX_EVENTS	128
 
 #define EVENT(E, P) (&(struct epoll_event) { .events = (E), .data.ptr = (P)})
-#define HANDLER(L, F) (&((L)->handler[F % (L)->n_handler]))
 
 typedef struct event_data {
 	int fd;
@@ -267,12 +266,12 @@ int event_listener_start(EventListener listener)
 {
 	for (int i = 0; i < listener->n_handler; i++)
 	{
-		EventHandler h = HANDLER(listener, i);
+		EventHandler h = listener->handler[i];
 
 		h->await = true;
 		if (thrd_create(&h->tid, event_handler, h) != thrd_success) {
 			for (int j = i - 1; j >= 0; j--) {
-				EventHandler h = HANDLER(listener, i);
+				EventHandler h = listener->handler[i];
 				h->is_running = false;
 				h->await = false;
 
@@ -285,8 +284,8 @@ int event_listener_start(EventListener listener)
 	}
 
 	for (int i = 0; i < listener->n_handler; i++) {
-		HANDLER(listener, i)->is_running = true;
-		HANDLER(listener, i)->await = false;
+		listener->handler[i]->is_running = true;
+		listener->handler[i]->await = false;
 	}
 
 	return 0;
@@ -295,14 +294,14 @@ int event_listener_start(EventListener listener)
 int event_listener_stop(EventListener listener)
 {
 	for (int i = 0; i < listener->n_handler; i++) {
-		EventHandler handler = HANDLER(listener, i);
+		EventHandler handler = listener->handler[i];
 
 		if (eventfd_write(handler->evfd, 1) == -1)
 			return -1;
 	}
 
 	for (int i = 0; i < listener->n_handler; i++) {
-		EventHandler handler = HANDLER(listener, i);
+		EventHandler handler = listener->handler[i];
 
 		if (thrd_join(handler->tid, NULL) != thrd_success)
 			return -1;
@@ -314,7 +313,7 @@ int event_listener_stop(EventListener listener)
 int event_listener_destroy(EventListener listener)
 {
 	for (int i = 0; i < listener->n_handler; i++)
-		event_handler_destroy(&listener->handler[i]);
+		event_handler_destroy(listener->handler[i]);
 
 	free(listener->handler);
 	free(listener);
