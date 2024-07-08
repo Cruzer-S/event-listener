@@ -109,7 +109,7 @@ static EventHandler event_handler_create(void)
 
 	list_init_head(&handler->events);
 
-	return 0;
+	return handler;
 
 CLOSE_EVENT:	close(evfd);
 CLOSE_EPOLL:	close(epfd);
